@@ -1,0 +1,768 @@
+#!/usr/bin/env python3
+"""ha-debug: Home Assistant debugging CLI for troubleshooting automations, sensors, and light groups.
+
+This tool queries the Home Assistant REST API to provide debugging views
+that are tedious to assemble manually. It reads HASS_TOKEN and HASS_SERVER
+from the environment (set them before running, or source your ha script).
+
+Subcommands:
+  timeline   Interleaved, time-sorted state history for multiple entities
+  flap       Detect flapping sensors (abnormally short on/off cycles)
+  trace      Show the most recent automation trace with action timestamps
+  group      List member entities of a Zigbee/HA light group with status
+  overlap    Find automations that control the same entity
+  logbook    Human-readable logbook entries for an entity
+  states     List entities matching a pattern with current state
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta, timezone
+
+# Default paths to search for credentials
+HA_SCRIPT_PATHS = [
+    os.path.expanduser("~/bin/ha"),
+    "/home/asjoyner/bin/ha",
+]
+
+
+def _load_creds_from_script():
+    """Parse HASS_TOKEN and HASS_SERVER from the ha wrapper script."""
+    for path in HA_SCRIPT_PATHS:
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path) as f:
+                content = f.read()
+            token = None
+            server = None
+            for line in content.splitlines():
+                m = re.match(r"""^export\s+HASS_TOKEN=['"](.*?)['"]""", line)
+                if m:
+                    token = m.group(1)
+                m = re.match(r"""^export\s+HASS_SERVER=['"](.*?)['"]""", line)
+                if m:
+                    server = m.group(1)
+            if token and server:
+                return server, token
+        except OSError:
+            continue
+    return None, None
+
+
+def get_config():
+    token = os.environ.get("HASS_TOKEN")
+    server = os.environ.get("HASS_SERVER")
+    if not token or not server:
+        server, token = _load_creds_from_script()
+    if not token or not server:
+        print(
+            "Error: HASS_TOKEN and HASS_SERVER not found.",
+            file=sys.stderr,
+        )
+        print(
+            "  Set env vars, or ensure ~/bin/ha exports them.", file=sys.stderr
+        )
+        sys.exit(1)
+    return server.rstrip("/"), token
+
+
+def api_get(path, params=None):
+    server, token = get_config()
+    url = f"{server}/api/{path}"
+    if params:
+        qs = "&".join(
+            f"{k}={urllib.parse.quote(str(v), safe='')}"
+            for k, v in params.items()
+            if v is not None
+        )
+        if qs:
+            url += f"?{qs}"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        print(f"HTTP {e.code}: {e.reason}", file=sys.stderr)
+        try:
+            print(e.read().decode(), file=sys.stderr)
+        except Exception:
+            pass
+        sys.exit(1)
+    except urllib.error.URLError as e:
+        print(f"Connection error: {e.reason}", file=sys.stderr)
+        sys.exit(1)
+
+
+def api_post(path, payload):
+    server, token = get_config()
+    url = f"{server}/api/{path}"
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        print(f"HTTP {e.code}: {e.reason}", file=sys.stderr)
+        try:
+            print(e.read().decode(), file=sys.stderr)
+        except Exception:
+            pass
+        sys.exit(1)
+
+
+def parse_since(since_str):
+    """Parse a duration string like '10m', '1h', '30s' into a timedelta."""
+    m = re.match(r"^(\d+)([smhd])$", since_str)
+    if not m:
+        print(
+            f"Error: invalid duration '{since_str}'. Use e.g. 10m, 1h, 30s, 2d",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    val = int(m.group(1))
+    unit = m.group(2)
+    units = {"s": "seconds", "m": "minutes", "h": "hours", "d": "days"}
+    return timedelta(**{units[unit]: val})
+
+
+def format_ts(iso_str):
+    """Format an ISO timestamp to a short local-friendly string."""
+    if not iso_str:
+        return "?"
+    # Strip to just time portion for readability
+    try:
+        dt = datetime.fromisoformat(iso_str)
+        return dt.strftime("%H:%M:%S.%f")[:-3]
+    except Exception:
+        return iso_str
+
+
+def get_all_states():
+    """Fetch all entity states (cached per invocation)."""
+    if not hasattr(get_all_states, "_cache"):
+        get_all_states._cache = api_get("states")
+    return get_all_states._cache
+
+
+def find_entities(pattern):
+    """Find entities matching a substring or glob pattern."""
+    states = get_all_states()
+    results = []
+    # Convert simple glob to regex
+    regex_pat = pattern.replace(".", r"\.").replace("*", ".*").replace("?", ".")
+    regex = re.compile(regex_pat, re.IGNORECASE)
+    for s in states:
+        if regex.search(s["entity_id"]):
+            results.append(s)
+    return results
+
+
+# ─── Subcommands ───
+
+
+def cmd_timeline(args):
+    """Show interleaved state history for multiple entities.
+
+    Examples:
+      ha-debug timeline light.zg_everything binary_sensor.presence_sensor_everything --since 10m
+      ha-debug timeline 'binary_sensor.*kitchen*' --since 1h
+    """
+    entities = []
+    for pattern in args.entities:
+        if "*" in pattern or "?" in pattern:
+            matches = find_entities(pattern)
+            entities.extend(e["entity_id"] for e in matches)
+        else:
+            entities.append(pattern)
+
+    if not entities:
+        print("No matching entities found.", file=sys.stderr)
+        return
+
+    delta = parse_since(args.since)
+    start = datetime.now(timezone.utc) - delta
+    start_str = start.strftime("%Y-%m-%dT%H:%M:%SZ")
+    end_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    entity_filter = ",".join(entities)
+    data = api_get(
+        f"history/period/{start_str}",
+        {
+            "end_time": end_str,
+            "filter_entity_id": entity_filter,
+            "minimal_response": "",
+        },
+    )
+
+    # Build interleaved timeline
+    events = []
+    for entity_history in data:
+        if not entity_history:
+            continue
+        eid = entity_history[0].get("entity_id", "unknown")
+        for state in entity_history:
+            ts = state.get("last_changed", state.get("last_updated", ""))
+            events.append((ts, eid, state["state"]))
+
+    events.sort(key=lambda x: x[0])
+
+    if not events:
+        print("No state changes found in the given period.")
+        return
+
+    # Find max entity_id length for formatting
+    max_eid = max(len(e[1]) for e in events)
+    fmt = f"{{:<13}} {{:<{max_eid}}} {{}}"
+    print(fmt.format("TIME", "ENTITY", "STATE"))
+    print("-" * (14 + max_eid + 10))
+    for ts, eid, state in events:
+        print(fmt.format(format_ts(ts), eid, state))
+
+
+def cmd_flap(args):
+    """Detect flapping sensors: show on/off durations and flag short cycles.
+
+    Examples:
+      ha-debug flap binary_sensor.presence_sensor_everything --since 30m
+      ha-debug flap binary_sensor.presence_sensor_everything --since 1h --threshold 30
+    """
+    delta = parse_since(args.since)
+    start = datetime.now(timezone.utc) - delta
+    start_str = start.strftime("%Y-%m-%dT%H:%M:%SZ")
+    end_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    data = api_get(
+        f"history/period/{start_str}",
+        {
+            "end_time": end_str,
+            "filter_entity_id": args.entity,
+            "minimal_response": "",
+        },
+    )
+
+    if not data or not data[0]:
+        print("No history found.")
+        return
+
+    history = data[0]
+    eid = history[0].get("entity_id", args.entity)
+    threshold = args.threshold
+
+    print(f"Flap analysis for {eid} (threshold: {threshold}s)")
+    print(f"{'TIME':<13} {'STATE':<6} {'DURATION':>10}  {'FLAG'}")
+    print("-" * 45)
+
+    flap_count = 0
+    short_on = []
+    short_off = []
+
+    for i, state in enumerate(history):
+        ts = state.get("last_changed", state.get("last_updated", ""))
+        s = state["state"]
+        try:
+            dt = datetime.fromisoformat(ts)
+        except Exception:
+            continue
+
+        # Calculate duration until next state change
+        duration_str = ""
+        flag = ""
+        if i + 1 < len(history):
+            next_ts = history[i + 1].get(
+                "last_changed", history[i + 1].get("last_updated", "")
+            )
+            try:
+                next_dt = datetime.fromisoformat(next_ts)
+                dur = (next_dt - dt).total_seconds()
+                duration_str = f"{dur:.1f}s"
+                if dur < threshold:
+                    flag = " ⚠ SHORT"
+                    flap_count += 1
+                    if s == "on":
+                        short_on.append(dur)
+                    else:
+                        short_off.append(dur)
+            except Exception:
+                pass
+        else:
+            duration_str = "(current)"
+
+        print(f"{format_ts(ts):<13} {s:<6} {duration_str:>10} {flag}")
+
+    print()
+    total_changes = len(history) - 1
+    if total_changes > 0:
+        changes_per_min = total_changes / (delta.total_seconds() / 60)
+        print(f"Total state changes: {total_changes} ({changes_per_min:.1f}/min)")
+        print(f"Short cycles (<{threshold}s): {flap_count}")
+        if short_on:
+            avg = sum(short_on) / len(short_on)
+            print(f"  Short ON durations: avg {avg:.1f}s (n={len(short_on)})")
+        if short_off:
+            avg = sum(short_off) / len(short_off)
+            print(f"  Short OFF durations: avg {avg:.1f}s (n={len(short_off)})")
+        if flap_count > 2:
+            print(
+                "\n⚠ FLAPPING DETECTED: Sensor is unstable. Consider recalibrating the detection zone."
+            )
+
+
+def cmd_trace(args):
+    """Show the most recent automation trace with action timestamps.
+
+    Examples:
+      ha-debug trace automation.motion_activated_light_everything
+      ha-debug trace automation.motion_activated_light_kitchen
+    """
+    entity = args.entity
+    if not entity.startswith("automation."):
+        entity = f"automation.{entity}"
+
+    # Use the websocket-compatible REST endpoint for traces
+    # Traces are available via /api/trace/<domain>/<item_id>
+    automation_id = entity.replace("automation.", "")
+
+    # First get the automation state to find the trace ID
+    state = api_get(f"states/{entity}")
+    if not state:
+        print(f"Automation {entity} not found.", file=sys.stderr)
+        return
+
+    attrs = state.get("attributes", {})
+    print(f"Automation: {attrs.get('friendly_name', entity)}")
+    print(f"  State: {state['state']}")
+    print(f"  Mode: {attrs.get('mode', '?')}")
+    print(f"  Current runs: {attrs.get('current', 0)}")
+    print(f"  Last triggered: {format_ts(attrs.get('last_triggered', ''))}")
+    print()
+
+    # Try to get traces
+    try:
+        # The trace list endpoint
+        traces = api_get(f"trace/automation/{attrs.get('id', automation_id)}")
+        if not traces:
+            print("No traces available. Enable trace storage in the automation.")
+            return
+
+        # Show most recent trace
+        trace = traces[-1] if isinstance(traces, list) else traces
+        run_id = trace.get("run_id", "?")
+        print(f"Most recent trace (run_id: {run_id}):")
+
+        # Get full trace details
+        trace_detail = api_get(
+            f"trace/automation/{attrs.get('id', automation_id)}/{run_id}"
+        )
+        if trace_detail:
+            trace_nodes = trace_detail.get("trace", {})
+            # Print trace nodes in order
+            for node_path, node_list in sorted(trace_nodes.items()):
+                for node in node_list:
+                    ts = node.get("timestamp", "")
+                    result = node.get("result", {})
+                    changed = node.get("changed_variables", {})
+                    error = node.get("error", "")
+
+                    line = f"  {format_ts(ts)} {node_path}"
+                    if result:
+                        params = result.get("params", {})
+                        if params:
+                            line += f" -> {json.dumps(params, default=str)}"
+                        if result.get("enabled") is False:
+                            line += " [DISABLED]"
+                    if error:
+                        line += f" ⚠ ERROR: {error}"
+                    print(line)
+    except Exception as e:
+        print(f"Could not fetch traces: {e}", file=sys.stderr)
+        print(
+            "Note: automation traces require the automation ID, which may differ from the entity ID."
+        )
+
+
+def cmd_group(args):
+    """List member entities of a light group with their current state and availability.
+
+    Works with both HA groups and Zigbee groups by finding entities whose names
+    suggest membership (e.g. 'kitchen_walkways_*' for 'light.zg_kitchen_walkways').
+
+    Examples:
+      ha-debug group light.zg_everything
+      ha-debug group light.zg_kitchen_walkways
+    """
+    entity = args.entity
+
+    # First check if it's an HA group with entity_id attributes
+    state = api_get(f"states/{entity}")
+    if not state:
+        print(f"Entity {entity} not found.", file=sys.stderr)
+        return
+
+    attrs = state.get("attributes", {})
+    print(f"Group: {entity}")
+    print(f"  State: {state['state']}")
+    print(f"  Last changed: {format_ts(state.get('last_changed', ''))}")
+    print()
+
+    # Check for HA group members in attributes
+    members = attrs.get("entity_id", [])
+    if members:
+        print(f"HA group members ({len(members)}):")
+        for member_id in members:
+            m_state = api_get(f"states/{member_id}")
+            if m_state:
+                m_attrs = m_state.get("attributes", {})
+                name = m_attrs.get("friendly_name", member_id)
+                print(
+                    f"  {member_id:<50} {m_state['state']:<15} {format_ts(m_state.get('last_changed', ''))}"
+                )
+        return
+
+    # For Zigbee groups, find likely members by name pattern
+    # e.g. light.zg_everything -> find light.*everything*
+    base = entity.split(".")[-1]
+    # Remove zg_ prefix
+    base = re.sub(r"^zg_", "", base)
+
+    all_states = get_all_states()
+    domain = entity.split(".")[0]
+    members = []
+    for s in all_states:
+        eid = s["entity_id"]
+        if eid == entity:
+            continue
+        if not eid.startswith(f"{domain}."):
+            continue
+        eid_name = eid.split(".")[-1]
+        # Match entities that contain the base name
+        if base in eid_name:
+            members.append(s)
+
+    if members:
+        on_count = sum(1 for m in members if m["state"] == "on")
+        off_count = sum(1 for m in members if m["state"] == "off")
+        unavail_count = sum(1 for m in members if m["state"] == "unavailable")
+        print(
+            f"Likely Zigbee group members (matched by name '{base}'): {len(members)}"
+        )
+        print(f"  Summary: {on_count} on, {off_count} off, {unavail_count} unavailable")
+        print()
+        print(f"  {'ENTITY':<55} {'STATE':<15} {'LAST CHANGED'}")
+        print(f"  {'-'*55} {'-'*15} {'-'*13}")
+        for m in sorted(members, key=lambda x: x["entity_id"]):
+            print(
+                f"  {m['entity_id']:<55} {m['state']:<15} {format_ts(m.get('last_changed', ''))}"
+            )
+    else:
+        print(f"No member entities found matching pattern '{base}'.")
+        print("This entity may not be a group, or members use different naming.")
+
+
+def cmd_overlap(args):
+    """Find automations and groups that reference the same entity.
+
+    Useful for detecting when two automations fight over the same light.
+
+    Examples:
+      ha-debug overlap light.zg_everything
+      ha-debug overlap light.kitchen_walkways_in_everything
+    """
+    target = args.entity
+
+    # Search automation configs for references to this entity
+    all_states = get_all_states()
+
+    print(f"Finding references to: {target}")
+    print()
+
+    # Check automations
+    automations = [s for s in all_states if s["entity_id"].startswith("automation.")]
+    print(f"Checking {len(automations)} automations...")
+
+    # We need to check the actual automation config. Read automations.yaml if accessible.
+    config_dir = os.environ.get("HASS_CONFIG_DIR", "/var/lib/hass/config")
+    automations_file = os.path.join(config_dir, "automations.yaml")
+
+    found_automations = []
+    try:
+        with open(automations_file) as f:
+            content = f.read()
+        # Simple search: find automation blocks that reference the target
+        # Split by top-level '- id:' entries
+        blocks = re.split(r"(?=^- id:)", content, flags=re.MULTILINE)
+        for block in blocks:
+            if target in block:
+                # Extract alias
+                alias_m = re.search(r"alias:\s*['\"]?(.+?)['\"]?\s*$", block, re.MULTILINE)
+                id_m = re.search(r"id:\s*['\"]?(.+?)['\"]?\s*$", block, re.MULTILINE)
+                alias = alias_m.group(1) if alias_m else "?"
+                aid = id_m.group(1) if id_m else "?"
+                found_automations.append((aid, alias, block.strip()))
+    except FileNotFoundError:
+        print(f"  (Cannot read {automations_file} — showing entity-based results only)")
+        # Fall back to checking automation attributes
+        for auto in automations:
+            attrs = auto.get("attributes", {})
+            # Can't inspect config via states, just note them
+            pass
+
+    if found_automations:
+        print(f"\n  Automations referencing {target}:")
+        for aid, alias, block in found_automations:
+            print(f"    - {alias} (id: {aid})")
+            # Show the relevant lines
+            for line in block.split("\n"):
+                if target in line:
+                    print(f"      {line.strip()}")
+    else:
+        print(f"  No automations reference {target} directly.")
+
+    # Check light groups in configuration.yaml
+    config_file = os.path.join(config_dir, "configuration.yaml")
+    try:
+        with open(config_file) as f:
+            config_content = f.read()
+        if target in config_content:
+            print(f"\n  Found in configuration.yaml:")
+            for i, line in enumerate(config_content.split("\n"), 1):
+                if target in line:
+                    print(f"    line {i}: {line.strip()}")
+    except FileNotFoundError:
+        pass
+
+    # Check for Zigbee group overlap by name
+    target_name = target.split(".")[-1]
+    base_names = set()
+    # Extract potential group base names from entity name
+    # e.g. kitchen_walkways_in_everything -> kitchen_walkways, everything
+    parts = target_name.split("_in_")
+    if len(parts) == 2:
+        base_names.add(parts[0])
+        base_names.add(parts[1])
+        print(f"\n  Zigbee group overlap detected!")
+        print(f"    This entity name suggests membership in multiple groups:")
+        for base in sorted(base_names):
+            zg_entity = f"light.zg_{base}"
+            s = api_get(f"states/{zg_entity}")
+            if s and "entity_id" in s:
+                print(f"    - {zg_entity} (state: {s['state']})")
+
+
+def cmd_logbook(args):
+    """Show human-readable logbook entries for an entity.
+
+    Examples:
+      ha-debug logbook light.zg_everything --since 10m
+      ha-debug logbook binary_sensor.presence_sensor_everything --since 1h
+    """
+    delta = parse_since(args.since)
+    start = datetime.now(timezone.utc) - delta
+    start_str = start.strftime("%Y-%m-%dT%H:%M:%SZ")
+    end_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    data = api_get(
+        f"logbook/{start_str}",
+        {"end_time": end_str, "entity": args.entity},
+    )
+
+    if not data:
+        # Fall back to history API
+        print(f"(Logbook empty, falling back to history API)")
+        data = api_get(
+            f"history/period/{start_str}",
+            {
+                "end_time": end_str,
+                "filter_entity_id": args.entity,
+                "minimal_response": "",
+            },
+        )
+        if data and data[0]:
+            history = data[0]
+            eid = history[0].get("entity_id", args.entity)
+            print(f"\nHistory for {eid}:")
+            print(f"{'TIME':<13} {'STATE'}")
+            print("-" * 25)
+            for state in history:
+                ts = state.get("last_changed", state.get("last_updated", ""))
+                print(f"{format_ts(ts):<13} {state['state']}")
+        else:
+            print("No entries found.")
+        return
+
+    print(f"Logbook for {args.entity}:")
+    print(f"{'TIME':<13} {'NAME':<40} {'MESSAGE'}")
+    print("-" * 70)
+    for entry in data:
+        ts = entry.get("when", "")
+        name = entry.get("name", "")
+        message = entry.get("message", entry.get("state", ""))
+        print(f"{format_ts(ts):<13} {name:<40} {message}")
+
+
+def cmd_states(args):
+    """List entities matching a pattern with current state.
+
+    Examples:
+      ha-debug states '*everything*'
+      ha-debug states 'binary_sensor.*kitchen*'
+      ha-debug states 'light.zg_*'
+    """
+    matches = find_entities(args.pattern)
+    if not matches:
+        print(f"No entities matching '{args.pattern}'.")
+        return
+
+    # Sort by entity_id
+    matches.sort(key=lambda x: x["entity_id"])
+
+    max_eid = max(len(m["entity_id"]) for m in matches)
+    fmt = f"{{:<{max_eid}}} {{:<15}} {{}}"
+    print(fmt.format("ENTITY", "STATE", "LAST CHANGED"))
+    print("-" * (max_eid + 30))
+    for m in matches:
+        print(
+            fmt.format(
+                m["entity_id"], m["state"], format_ts(m.get("last_changed", ""))
+            )
+        )
+    print(f"\n{len(matches)} entities found.")
+
+
+# ─── Main ───
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="ha-debug",
+        description="Home Assistant debugging CLI for troubleshooting automations, sensors, and light groups.",
+        epilog="Set HASS_TOKEN and HASS_SERVER environment variables before use.",
+    )
+    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+
+    # timeline
+    p = subparsers.add_parser(
+        "timeline",
+        help="Interleaved state history for multiple entities",
+        description=cmd_timeline.__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument(
+        "entities",
+        nargs="+",
+        help="Entity IDs or glob patterns (e.g. 'binary_sensor.*kitchen*')",
+    )
+    p.add_argument(
+        "--since", default="10m", help="How far back to look (e.g. 10m, 1h, 2d)"
+    )
+
+    # flap
+    p = subparsers.add_parser(
+        "flap",
+        help="Detect flapping sensors",
+        description=cmd_flap.__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("entity", help="Binary sensor entity ID")
+    p.add_argument(
+        "--since", default="30m", help="How far back to look (e.g. 30m, 1h)"
+    )
+    p.add_argument(
+        "--threshold",
+        type=float,
+        default=30,
+        help="Seconds below which a cycle is 'short' (default: 30)",
+    )
+
+    # trace
+    p = subparsers.add_parser(
+        "trace",
+        help="Show recent automation trace",
+        description=cmd_trace.__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument(
+        "entity", help="Automation entity ID (with or without 'automation.' prefix)"
+    )
+
+    # group
+    p = subparsers.add_parser(
+        "group",
+        help="List group members with state and availability",
+        description=cmd_group.__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("entity", help="Light group entity ID (e.g. light.zg_everything)")
+
+    # overlap
+    p = subparsers.add_parser(
+        "overlap",
+        help="Find automations/groups referencing the same entity",
+        description=cmd_overlap.__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("entity", help="Entity ID to search for")
+
+    # logbook
+    p = subparsers.add_parser(
+        "logbook",
+        help="Human-readable logbook entries",
+        description=cmd_logbook.__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("entity", help="Entity ID")
+    p.add_argument(
+        "--since", default="10m", help="How far back to look (e.g. 10m, 1h)"
+    )
+
+    # states
+    p = subparsers.add_parser(
+        "states",
+        help="List entities matching a pattern",
+        description=cmd_states.__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument(
+        "pattern", help="Glob pattern to match entity IDs (e.g. '*everything*')"
+    )
+
+    args = parser.parse_args()
+    if not args.command:
+        parser.print_help()
+        sys.exit(0)
+
+    commands = {
+        "timeline": cmd_timeline,
+        "flap": cmd_flap,
+        "trace": cmd_trace,
+        "group": cmd_group,
+        "overlap": cmd_overlap,
+        "logbook": cmd_logbook,
+        "states": cmd_states,
+    }
+    commands[args.command](args)
+
+
+if __name__ == "__main__":
+    main()
