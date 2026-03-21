@@ -19,41 +19,40 @@ import argparse
 import json
 import os
 import re
-import subprocess
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-# Default paths to search for credentials
-HA_SCRIPT_PATHS = [
-    os.path.expanduser("~/bin/ha"),
-    "/home/asjoyner/bin/ha",
-]
+CRED_FILE_PATH = os.path.expanduser("~/.config/ha-debug/credentials")
 
 
-def _load_creds_from_script():
-    """Parse HASS_TOKEN and HASS_SERVER from the ha wrapper script."""
-    for path in HA_SCRIPT_PATHS:
-        if not os.path.isfile(path):
-            continue
-        try:
-            with open(path) as f:
-                content = f.read()
-            token = None
-            server = None
-            for line in content.splitlines():
-                m = re.match(r"""^export\s+HASS_TOKEN=['"](.*?)['"]""", line)
-                if m:
-                    token = m.group(1)
-                m = re.match(r"""^export\s+HASS_SERVER=['"](.*?)['"]""", line)
-                if m:
-                    server = m.group(1)
-            if token and server:
-                return server, token
-        except OSError:
-            continue
+def _load_creds_from_config():
+    """Load HASS_TOKEN and HASS_SERVER from the shared credential file."""
+    if not os.path.isfile(CRED_FILE_PATH):
+        return None, None
+    token = None
+    server = None
+    try:
+        with open(CRED_FILE_PATH) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key = key.strip()
+                value = value.strip().strip("'\"")
+                if key == "HASS_TOKEN":
+                    token = value
+                elif key == "HASS_SERVER":
+                    server = value
+    except OSError:
+        return None, None
+    if token and server:
+        return server, token
     return None, None
 
 
@@ -61,14 +60,15 @@ def get_config():
     token = os.environ.get("HASS_TOKEN")
     server = os.environ.get("HASS_SERVER")
     if not token or not server:
-        server, token = _load_creds_from_script()
+        server, token = _load_creds_from_config()
     if not token or not server:
         print(
             "Error: HASS_TOKEN and HASS_SERVER not found.",
             file=sys.stderr,
         )
         print(
-            "  Set env vars, or ensure ~/bin/ha exports them.", file=sys.stderr
+            f"  Set env vars or create {CRED_FILE_PATH} with HASS_TOKEN and HASS_SERVER.",
+            file=sys.stderr,
         )
         sys.exit(1)
     return server.rstrip("/"), token
