@@ -6,13 +6,14 @@ that are tedious to assemble manually. It reads HASS_TOKEN and HASS_SERVER
 from the environment (set them before running, or source your ha script).
 
 Subcommands:
-  timeline   Interleaved, time-sorted state history for multiple entities
-  flap       Detect flapping sensors (abnormally short on/off cycles)
-  trace      Show the most recent automation trace with action timestamps
-  group      List member entities of a Zigbee/HA light group with status
-  overlap    Find automations that control the same entity
-  logbook    Human-readable logbook entries for an entity
-  states     List entities matching a pattern with current state
+  timeline       Interleaved, time-sorted state history for multiple entities
+  flap           Detect flapping sensors (abnormally short on/off cycles)
+  trace          Show the most recent automation trace with action timestamps
+  group          List member entities of a Zigbee/HA light group with status
+  overlap        Find automations that control the same entity
+  logbook        Human-readable logbook entries for an entity
+  states         List entities matching a pattern with current state
+  lovelace-save  Save a Lovelace dashboard config from a JSON file
 """
 
 import argparse
@@ -650,6 +651,195 @@ def cmd_states(args):
     print(f"\n{len(matches)} entities found.")
 
 
+def _ws_send_and_receive(msg):
+    """Send a message over the HA websocket API and return the response.
+
+    Handles authentication automatically. Uses only the stdlib (no asyncio,
+    no third-party websocket library) via a minimal websocket client built
+    on the http.client module.
+    """
+    import hashlib
+    import struct
+
+    server, token = get_config()
+    ws_url = server.replace("http://", "ws://").replace("https://", "wss://")
+    ws_url += "/api/websocket"
+
+    parsed = urllib.parse.urlparse(ws_url)
+    host = parsed.hostname
+    port = parsed.port or (443 if parsed.scheme == "wss" else 80)
+
+    import socket as _socket
+    import ssl as _ssl
+
+    raw = _socket.create_connection((host, port), timeout=30)
+    if parsed.scheme == "wss":
+        ctx = _ssl.create_default_context()
+        raw = ctx.wrap_socket(raw, server_hostname=host)
+
+    # WebSocket handshake
+    key = os.urandom(16)
+    import base64
+    key_b64 = base64.b64encode(key).decode()
+    path = parsed.path or "/api/websocket"
+    handshake = (
+        f"GET {path} HTTP/1.1\r\n"
+        f"Host: {host}:{port}\r\n"
+        f"Upgrade: websocket\r\n"
+        f"Connection: Upgrade\r\n"
+        f"Sec-WebSocket-Key: {key_b64}\r\n"
+        f"Sec-WebSocket-Version: 13\r\n"
+        f"\r\n"
+    )
+    raw.sendall(handshake.encode())
+
+    # Read HTTP response headers
+    resp = b""
+    while b"\r\n\r\n" not in resp:
+        chunk = raw.recv(4096)
+        if not chunk:
+            raise ConnectionError("WebSocket handshake failed: connection closed")
+        resp += chunk
+
+    if b"101" not in resp.split(b"\r\n")[0]:
+        raise ConnectionError(f"WebSocket handshake failed: {resp.split(b'\r\n')[0].decode()}")
+
+    def ws_recv():
+        """Read one WebSocket text frame."""
+        header = b""
+        while len(header) < 2:
+            header += raw.recv(2 - len(header))
+        byte1, byte2 = header[0], header[1]
+        masked = bool(byte2 & 0x80)
+        length = byte2 & 0x7F
+        if length == 126:
+            ext = b""
+            while len(ext) < 2:
+                ext += raw.recv(2 - len(ext))
+            length = struct.unpack(">H", ext)[0]
+        elif length == 127:
+            ext = b""
+            while len(ext) < 8:
+                ext += raw.recv(8 - len(ext))
+            length = struct.unpack(">Q", ext)[0]
+        mask_key = b""
+        if masked:
+            while len(mask_key) < 4:
+                mask_key += raw.recv(4 - len(mask_key))
+        payload = b""
+        while len(payload) < length:
+            payload += raw.recv(length - len(payload))
+        if masked:
+            payload = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
+        return json.loads(payload.decode())
+
+    def ws_send(obj):
+        """Send one masked WebSocket text frame."""
+        data = json.dumps(obj).encode()
+        frame = bytearray()
+        frame.append(0x81)  # FIN + text
+        mask_key = os.urandom(4)
+        length = len(data)
+        if length < 126:
+            frame.append(0x80 | length)
+        elif length < 65536:
+            frame.append(0x80 | 126)
+            frame.extend(struct.pack(">H", length))
+        else:
+            frame.append(0x80 | 127)
+            frame.extend(struct.pack(">Q", length))
+        frame.extend(mask_key)
+        masked = bytes(b ^ mask_key[i % 4] for i, b in enumerate(data))
+        frame.extend(masked)
+        raw.sendall(bytes(frame))
+
+    try:
+        # auth_required
+        resp_msg = ws_recv()
+        if resp_msg.get("type") != "auth_required":
+            raise ConnectionError(f"Expected auth_required, got: {resp_msg}")
+
+        # authenticate
+        ws_send({"type": "auth", "access_token": token})
+        resp_msg = ws_recv()
+        if resp_msg.get("type") != "auth_ok":
+            raise ConnectionError(f"Auth failed: {resp_msg}")
+
+        # send the actual message
+        ws_send(msg)
+        resp_msg = ws_recv()
+        return resp_msg
+    finally:
+        raw.close()
+
+
+def cmd_lovelace_read(args):
+    """Read a Lovelace dashboard config via websocket API and print as JSON.
+
+    Examples:
+      ha-debug lovelace-read dashboard-perimeter
+      ha-debug lovelace-read dashboard-perimeter -o /tmp/dashboard.json
+      ha-debug lovelace-read lovelace   # default dashboard
+    """
+    url_path = args.dashboard
+
+    msg = {
+        "id": 1,
+        "type": "lovelace/config",
+        "url_path": url_path,
+    }
+
+    result = _ws_send_and_receive(msg)
+    if not result.get("success"):
+        print(f"Failed to read dashboard: {result}", file=sys.stderr)
+        sys.exit(1)
+
+    config = result["result"]
+    output = json.dumps(config, indent=2)
+
+    if args.output:
+        with open(args.output, "w") as f:
+            f.write(output + "\n")
+        print(f"Dashboard '{url_path}' saved to {args.output}")
+    else:
+        print(output)
+
+
+def cmd_lovelace_save(args):
+    """Save a Lovelace dashboard config from a JSON file via websocket API.
+
+    The JSON file should contain the dashboard config object (the value of
+    the "config" key in the .storage file, i.e. the object with "views").
+
+    Examples:
+      ha-debug lovelace-save dashboard-perimeter config.json
+      ha-debug lovelace-save lovelace config.json   # default dashboard
+    """
+    config_file = args.config_file
+    url_path = args.dashboard
+
+    try:
+        with open(config_file) as f:
+            config = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"Error reading {config_file}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    msg = {
+        "id": 1,
+        "type": "lovelace/config/save",
+        "url_path": url_path,
+        "config": config,
+    }
+
+    result = _ws_send_and_receive(msg)
+    if result.get("success"):
+        print(f"Dashboard '{url_path}' updated successfully.")
+    else:
+        print(f"Failed to update dashboard: {result}", file=sys.stderr)
+        sys.exit(1)
+
+
 # ─── Main ───
 
 
@@ -747,6 +937,26 @@ def main():
         "pattern", help="Glob pattern to match entity IDs (e.g. '*everything*')"
     )
 
+    # lovelace-read
+    p = subparsers.add_parser(
+        "lovelace-read",
+        help="Read a Lovelace dashboard config as JSON",
+        description=cmd_lovelace_read.__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("dashboard", help="Dashboard URL path (e.g. 'dashboard-perimeter' or 'lovelace')")
+    p.add_argument("-o", "--output", help="Write to file instead of stdout")
+
+    # lovelace-save
+    p = subparsers.add_parser(
+        "lovelace-save",
+        help="Save a Lovelace dashboard config from a JSON file",
+        description=cmd_lovelace_save.__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("dashboard", help="Dashboard URL path (e.g. 'dashboard-perimeter' or 'lovelace')")
+    p.add_argument("config_file", help="Path to JSON file containing the dashboard config")
+
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
@@ -760,6 +970,8 @@ def main():
         "overlap": cmd_overlap,
         "logbook": cmd_logbook,
         "states": cmd_states,
+        "lovelace-read": cmd_lovelace_read,
+        "lovelace-save": cmd_lovelace_save,
     }
     commands[args.command](args)
 
